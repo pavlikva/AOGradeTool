@@ -21,7 +21,11 @@ This application is optimized for **fast, keyboard-driven grading** of large bat
 
 > The tool is designed for **question-by-question** as well as **student-by-student grading**.
 
-### First time
+### Run
+
+`python3 gradetool.py`
+
+### New assignment grading
 
 1. Load submissions folder  
 2. Define questions  
@@ -34,7 +38,7 @@ This application is optimized for **fast, keyboard-driven grading** of large bat
 7. Repeat for the next question or student
 8. Save (automatic saves also happen when you select a different student)
 
-### Resume work
+### Resume grading
 
 1. Load CSV file
 2. Optionally load the submissions folder (if it does not load automatically)
