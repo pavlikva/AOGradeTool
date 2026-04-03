@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import uuid
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,6 +27,12 @@ QUESTION_ACTIVE_SELECT_BG = "#cfe3ff"
 STUDENT_NONE_BG = "#ffffff"
 STUDENT_PARTIAL_BG = "#fef3c7"
 STUDENT_DONE_BG = "#dcfce7"
+
+APP_VERSION = "1.4"
+MAX_RENDER_CACHE_ENTRIES = 2
+MAX_PREFETCH_CACHE_ENTRIES = 2
+MAX_PREFETCH_BYTES = 20 * 1024 * 1024
+MAX_PREFETCH_RENDER_BYTES = 12 * 1024 * 1024
 
 @dataclass
 class Bucket:
@@ -528,7 +535,7 @@ class QuestionDialog(tk.Toplevel):
 class OfflineGraderApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Astronomy Olympiad PDF Grader")
+        self.root.title(f"Astronomy Olympiad PDF Grader")
         self.root.geometry("1500x950")
 
         self.submission_dir: Optional[Path] = None
@@ -560,10 +567,10 @@ class OfflineGraderApp:
         self.min_zoom = 0.5
         self.max_zoom = 3.0
         self._prefetch_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="pdf-prefetch")
-        self._prefetch_cache: dict[Path, bytes] = {}
+        self._prefetch_cache: OrderedDict[Path, bytes] = OrderedDict()
         self._prefetch_inflight: set[Path] = set()
         self._render_prefetch_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdf-render")
-        self._render_cache: dict[tuple[str, int, float], RenderedPDFBundle] = {}
+        self._render_cache: OrderedDict[tuple[str, int, float], RenderedPDFBundle] = OrderedDict()
         self._render_inflight: set[tuple[str, int, float]] = set()
         self._view_render_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdf-view-render")
         self._view_render_request_id = 0
@@ -571,6 +578,12 @@ class OfflineGraderApp:
         self._view_render_pending_key: Optional[tuple[str, int, float]] = None
         self._view_render_pending_request: Optional[PDFRenderRequest] = None
         self._preview_render_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdf-preview-render")
+        self._page_render_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="pdf-page-render")
+        self._page_render_cache: OrderedDict[tuple[str, int, float, int], Image.Image] = OrderedDict()
+        self._page_render_inflight: set[tuple[str, int, float, int]] = set()
+        self._page_render_request_id = 0
+        self._page_layout_key: Optional[tuple[str, int, float]] = None
+        self._page_photo_refs: dict[int, ImageTk.PhotoImage] = {}
 
         self.bucket_buttons: dict[str, tk.Button] = {}
         self.bucket_button_specs: dict[str, Bucket] = {}
@@ -580,13 +593,27 @@ class OfflineGraderApp:
         self._set_app_icon()
         self._build_ui()
         self._bind_shortcuts()
-        self._update_status("Load a submission folder to begin.")
+        self._update_status(f"Load a submission folder to begin.")
 
     def _current_display_width(self) -> int:
         return max(650, self.canvas.winfo_width() - 25)
 
     def _render_cache_key(self, path: Path, display_width: int, zoom_factor: float) -> tuple[str, int, float]:
         return (str(path.resolve()), int(display_width), round(float(zoom_factor), 3))
+
+    def _trim_render_cache(self) -> None:
+        while len(self._render_cache) > MAX_RENDER_CACHE_ENTRIES:
+            self._render_cache.popitem(last=False)
+
+    def _trim_prefetch_cache(self) -> None:
+        while len(self._prefetch_cache) > MAX_PREFETCH_CACHE_ENTRIES:
+            self._prefetch_cache.popitem(last=False)
+
+    def _pdf_is_too_large_for_prefetch(self, path: Path) -> bool:
+        try:
+            return path.stat().st_size > MAX_PREFETCH_BYTES
+        except OSError:
+            return True
 
     def _render_pdf_bundle(self, path: Path, display_width: int, zoom_factor: float, source_bytes: Optional[bytes] = None) -> RenderedPDFBundle:
         doc = fitz.open(stream=source_bytes, filetype="pdf") if source_bytes is not None else fitz.open(str(path))
@@ -611,54 +638,84 @@ class OfflineGraderApp:
         finally:
             doc.close()
 
-    def _queue_student_pdf_render_prefetch(self, index: int) -> None:
-        if index < 0 or index >= len(self.students):
-            return
+    def _page_layout_cache_key(self, path: Path, display_width: int, zoom_factor: float) -> tuple[str, int, float]:
+        return (str(path.resolve()), int(display_width), round(float(zoom_factor), 3))
 
-        pdf_path = self._student_key_to_path(self.students[index])
-        if pdf_path is None:
-            return
+    def _page_render_cache_key(self, path: Path, display_width: int, zoom_factor: float, page_index: int) -> tuple[str, int, float, int]:
+        return (*self._page_layout_cache_key(path, display_width, zoom_factor), int(page_index))
 
-        display_width = self._current_display_width()
-        key = self._render_cache_key(pdf_path, display_width, self.zoom_factor)
-        if key in self._render_cache or key in self._render_inflight:
-            return
+    def _trim_page_render_cache(self) -> None:
+        while len(self._page_render_cache) > MAX_RENDER_CACHE_ENTRIES:
+            self._page_render_cache.popitem(last=False)
 
-        self._render_inflight.add(key)
+    def _open_pdf_document(self, path: Path, source_bytes: Optional[bytes] = None) -> fitz.Document:
+        return fitz.open(stream=source_bytes, filetype="pdf") if source_bytes is not None else fitz.open(str(path))
 
-        future = self._render_prefetch_executor.submit(
-            self._render_pdf_bundle,
-            pdf_path,
-            display_width,
-            self.zoom_factor,
-            None,
-        )
+    def _build_page_layout(self, path: Path, display_width: int, zoom_factor: float, source_bytes: Optional[bytes] = None) -> tuple[list[dict[str, object]], list[Image.Image]]:
+        doc = self._open_pdf_document(path, source_bytes)
+        try:
+            page_positions: list[dict[str, object]] = []
+            thumb_images: list[Image.Image] = []
+            padding = 18
+            y = padding
+            thumb_width = 150
 
-        def _done(fut, cache_key=key):
-            self._render_inflight.discard(cache_key)
-            try:
-                bundle = fut.result()
-            except Exception:
-                return
-            self._render_cache[cache_key] = bundle
+            for i in range(doc.page_count):
+                page = doc.load_page(i)
+                scale = (display_width / page.rect.width) * zoom_factor
+                width = max(1, int(round(page.rect.width * scale)))
+                height = max(1, int(round(page.rect.height * scale)))
+                page_positions.append({
+                    "page_index": i,
+                    "top": y,
+                    "height": height,
+                    "width": width,
+                    "scale": scale,
+                })
 
-        future.add_done_callback(_done)
+                thumb_scale = thumb_width / max(1.0, float(page.rect.width))
+                pix = page.get_pixmap(matrix=fitz.Matrix(thumb_scale, thumb_scale), alpha=False)
+                thumb_images.append(Image.frombytes("RGB", [pix.width, pix.height], pix.samples))
+                y += height + padding
+
+            return page_positions, thumb_images
+        finally:
+            doc.close()
+
+    def _render_page_image(self, path: Path, page_index: int, display_width: int, zoom_factor: float, source_bytes: Optional[bytes] = None) -> Image.Image:
+        doc = self._open_pdf_document(path, source_bytes)
+        try:
+            page = doc.load_page(page_index)
+            scale = (display_width / page.rect.width) * zoom_factor
+            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+            return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        finally:
+            doc.close()
 
     def _cancel_view_render(self) -> None:
         self._view_render_request_id += 1
+        self._page_render_request_id += 1
         if self._view_render_after_id is not None:
             try:
                 self.root.after_cancel(self._view_render_after_id)
             except Exception:
                 pass
             self._view_render_after_id = None
+        if self.render_after_id is not None:
+            try:
+                self.root.after_cancel(self.render_after_id)
+            except Exception:
+                pass
+            self.render_after_id = None
         self._view_render_pending_key = None
         self._view_render_pending_request = None
+        self._page_layout_key = None
 
     def _show_pdf_loading_placeholder(self, text: str = "Rendering PDF preview...") -> None:
         self.canvas.delete("all")
         self.page_positions = []
         self.page_photos = []
+        self._page_photo_refs.clear()
         self.thumb_photos = []
         for child in self.thumb_frame.winfo_children():
             child.destroy()
@@ -668,108 +725,234 @@ class OfflineGraderApp:
     def _begin_view_render(self, path: Path, source_bytes: Optional[bytes], display_width: int, zoom_factor: float) -> None:
         self._cancel_view_render()
         request_id = self._view_render_request_id
-        cache_key = self._render_cache_key(path, display_width, zoom_factor)
-        if cache_key in self._render_cache:
-            bundle = self._render_cache[cache_key]
-            self._apply_render_bundle_to_canvas(bundle, display_width)
-            return
-
+        cache_key = self._page_layout_cache_key(path, display_width, zoom_factor)
         self.loading_pdf = True
-        self._view_render_pending_key = cache_key
-        request = PDFRenderRequest(
-            request_id=request_id,
-            path=path,
-            display_width=display_width,
-            zoom_factor=zoom_factor,
-            source_bytes=source_bytes,
-        )
-        self._view_render_pending_request = request
+        self._page_layout_key = cache_key
         self._show_pdf_loading_placeholder()
 
         future = self._view_render_executor.submit(
-            self._render_pdf_bundle,
+            self._build_page_layout,
             path,
             display_width,
             zoom_factor,
             source_bytes,
         )
 
-        def _done(fut, req=request, key=cache_key):
+        def _done(fut, req=request_id, key=cache_key, pdf_path=path, width=display_width) -> None:
             try:
-                bundle = fut.result()
+                page_positions, thumb_images = fut.result()
             except Exception as exc:
                 def _show_error() -> None:
-                    if req.request_id != self._view_render_request_id:
+                    if req != self._view_render_request_id:
                         return
                     self.loading_pdf = False
                     self._view_render_pending_request = None
                     self._view_render_pending_key = None
+                    self._page_layout_key = None
                     messagebox.showerror("PDF render failed", str(exc))
 
                 self.root.after(0, _show_error)
                 return
 
             def _apply() -> None:
-                if req.request_id != self._view_render_request_id:
+                if req != self._view_render_request_id or self.current_pdf_path != pdf_path:
                     return
                 self.loading_pdf = False
                 self._view_render_pending_request = None
                 self._view_render_pending_key = None
-                self._render_cache[key] = bundle
-                self._apply_render_bundle_to_canvas(bundle, display_width)
+                self._page_layout_key = None
+                self.page_positions = page_positions
+                self._apply_page_layout(page_positions, thumb_images, width)
+                self._schedule_rerender()
+                self._jump_to_current_question_anchor()
 
             self.root.after(0, _apply)
 
         future.add_done_callback(_done)
 
-    def _apply_render_bundle_to_canvas(self, bundle: RenderedPDFBundle, display_width: int) -> None:
-        self.loading_pdf = False
-        self._view_render_pending_key = None
-        self._view_render_pending_request = None
+    def _apply_page_layout(self, page_positions: list[dict[str, object]], thumb_images: list[Image.Image], display_width: int) -> None:
         self.canvas.delete("all")
-        self.page_positions = []
         self.page_photos = []
-        self.thumb_photos = []
-
+        self._page_photo_refs.clear()
         for child in self.thumb_frame.winfo_children():
             child.destroy()
+        self.thumb_photos = []
 
         self.root.update_idletasks()
-        padding = 18
-        y = padding
         max_content_width = 0
+        for i, pos in enumerate(page_positions):
+            top = float(pos["top"])
+            width = int(pos["width"])
+            height = int(pos["height"])
+            rect_id = self.canvas.create_rectangle(10, top, 10 + width, top + height, fill="white", outline="#d1d5db")
+            label_id = self.canvas.create_text(18, top + 12, anchor="nw", text=f"Page {i + 1}", fill=FG_LABEL, font=("Segoe UI", 10, "bold"))
+            placeholder_id = self.canvas.create_text(10 + width / 2, top + height / 2, text="Rendering...", fill="#9ca3af", font=("Segoe UI", 11))
+            pos["rect_id"] = rect_id
+            pos["label_id"] = label_id
+            pos["placeholder_id"] = placeholder_id
+            pos["image_id"] = None
+            max_content_width = max(max_content_width, width + 20)
 
-        for i, img in enumerate(bundle.page_images):
-            photo = ImageTk.PhotoImage(img)
-            self.page_photos.append(photo)
-            self.canvas.create_image(10, y, anchor="nw", image=photo)
-            self.page_positions.append({
-                "page_index": i,
-                "top": y,
-                "height": photo.height(),
-                "width": photo.width(),
-                "scale": photo.width() / max(1, img.width),
-            })
-            y += photo.height() + padding
-            max_content_width = max(max_content_width, photo.width() + 20)
+            if i < len(thumb_images):
+                tphoto = ImageTk.PhotoImage(thumb_images[i])
+                self.thumb_photos.append(tphoto)
+                btn = ttk.Button(self.thumb_frame, image=tphoto, command=lambda p=i: self.scroll_to_page(p))
+                btn.image = tphoto
+                btn.grid(row=i * 2, column=0, sticky="ew", pady=(0, 2))
+                ttk.Label(self.thumb_frame, text=f"Page {i + 1}").grid(row=i * 2 + 1, column=0, sticky="w", pady=(0, 8))
 
-            tphoto = ImageTk.PhotoImage(bundle.thumb_images[i])
-            self.thumb_photos.append(tphoto)
-            btn = ttk.Button(self.thumb_frame, image=tphoto, command=lambda p=i: self.scroll_to_page(p))
-            btn.image = tphoto
-            btn.grid(row=i * 2, column=0, sticky="ew", pady=(0, 2))
-            ttk.Label(self.thumb_frame, text=f"Page {i + 1}").grid(row=i * 2 + 1, column=0, sticky="w", pady=(0, 8))
-
-        total_height = y + padding
-        canvas_width = max(700, max_content_width, self.canvas.winfo_width())
-        self.canvas.configure(scrollregion=(0, 0, canvas_width, total_height))
+        total_height = (float(page_positions[-1]["top"]) + float(page_positions[-1]["height"]) + 18) if page_positions else 500
+        self.canvas.configure(scrollregion=(0, 0, max(display_width + 50, max_content_width, 700), total_height))
         self.thumb_canvas.configure(scrollregion=self.thumb_canvas.bbox("all"))
-        self._jump_to_current_question_anchor()
-        total_height = y + padding
-        self.canvas.configure(scrollregion=(0, 0, max(display_width + 50, 700), total_height))
-        self.thumb_canvas.configure(scrollregion=self.thumb_canvas.bbox("all"))
-        self._jump_to_current_question_anchor()
-    
+
+    def _visible_page_indices(self) -> list[int]:
+        if not self.page_positions:
+            return []
+        top = float(self.canvas.canvasy(0))
+        bottom = top + float(max(1, self.canvas.winfo_height()))
+        indices: list[int] = []
+        for idx, pos in enumerate(self.page_positions):
+            p_top = float(pos["top"])
+            p_bottom = p_top + float(pos["height"])
+            if p_bottom >= top - 40 and p_top <= bottom + 40:
+                indices.append(idx)
+        return indices
+
+    def _schedule_pdf_resize(self, _event=None) -> None:
+        if self.render_after_id is not None:
+            try:
+                self.root.after_cancel(self.render_after_id)
+            except Exception:
+                pass
+        self.render_after_id = self.root.after(180, self._rerender_layout_if_possible)
+
+    def _rerender_layout_if_possible(self) -> None:
+        self.render_after_id = None
+        if self.current_pdf_path is not None:
+            self._render_current_pdf()
+
+    def _schedule_rerender(self, _event=None) -> None:
+        if self.render_after_id is not None:
+            try:
+                self.root.after_cancel(self.render_after_id)
+            except Exception:
+                pass
+        self.render_after_id = self.root.after(120, self._refresh_visible_pages)
+
+    def _refresh_visible_pages(self) -> None:
+        if self.current_pdf_path is None or not self.page_positions:
+            return
+        visible = set(self._visible_page_indices())
+
+        for idx in list(self._page_photo_refs.keys()):
+            if idx not in visible:
+                pos = self.page_positions[idx]
+                image_id = pos.get("image_id")
+                if image_id is not None:
+                    try:
+                        self.canvas.itemconfigure(int(image_id), image="")
+                    except Exception:
+                        pass
+                self._page_photo_refs.pop(idx, None)
+
+        for idx in visible:
+            pos = self.page_positions[idx]
+            image_id = pos.get("image_id")
+            if image_id is not None and idx in self._page_photo_refs:
+                continue
+            cache_key = self._page_render_cache_key(self.current_pdf_path, self._current_display_width(), self.zoom_factor, idx)
+            cached = self._page_render_cache.get(cache_key)
+            if cached is not None:
+                self._page_render_cache.move_to_end(cache_key)
+                self._display_page_image(idx, cached)
+            else:
+                self._queue_page_render(idx)
+
+    def _queue_page_render(self, page_index: int) -> None:
+        if self.current_pdf_path is None or page_index < 0 or page_index >= len(self.page_positions):
+            return
+        cache_key = self._page_render_cache_key(self.current_pdf_path, self._current_display_width(), self.zoom_factor, page_index)
+        if cache_key in self._page_render_cache or cache_key in self._page_render_inflight:
+            return
+        self._page_render_inflight.add(cache_key)
+        request_id = self._view_render_request_id
+        path = self.current_pdf_path
+        display_width = self._current_display_width()
+        zoom_factor = self.zoom_factor
+        source_bytes = self.current_pdf_bytes
+
+        future = self._page_render_executor.submit(self._render_page_image, path, page_index, display_width, zoom_factor, source_bytes)
+
+        def _done(fut, req=request_id, key=cache_key, idx=page_index, pdf_path=path) -> None:
+            self._page_render_inflight.discard(key)
+            try:
+                image = fut.result()
+            except Exception:
+                return
+
+            def _apply() -> None:
+                if req != self._view_render_request_id or self.current_pdf_path != pdf_path:
+                    return
+                self._page_render_cache[key] = image
+                self._page_render_cache.move_to_end(key)
+                self._trim_page_render_cache()
+                self._display_page_image(idx, image)
+
+            self.root.after(0, _apply)
+
+        future.add_done_callback(_done)
+
+    def _display_page_image(self, page_index: int, image: Image.Image) -> None:
+        if page_index < 0 or page_index >= len(self.page_positions):
+            return
+        pos = self.page_positions[page_index]
+        top = float(pos["top"])
+        width = int(pos["width"])
+        height = int(pos["height"])
+        photo = ImageTk.PhotoImage(image)
+        self._page_photo_refs[page_index] = photo
+        image_id = pos.get("image_id")
+        if image_id is None:
+            image_id = self.canvas.create_image(10, top, anchor="nw", image=photo)
+            pos["image_id"] = image_id
+            try:
+                self.canvas.tag_raise(int(image_id), int(pos.get("placeholder_id", 0)))
+            except Exception:
+                pass
+        else:
+            try:
+                self.canvas.itemconfigure(int(image_id), image=photo)
+            except Exception:
+                return
+        try:
+            self.canvas.coords(int(image_id), 10, top)
+            self.canvas.tag_raise(int(image_id))
+        except Exception:
+            pass
+
+    def _render_pdf_bundle(self, path: Path, display_width: int, zoom_factor: float, source_bytes: Optional[bytes] = None) -> RenderedPDFBundle:
+        doc = fitz.open(stream=source_bytes, filetype="pdf") if source_bytes is not None else fitz.open(str(path))
+        try:
+            page_images: list[Image.Image] = []
+            thumb_images: list[Image.Image] = []
+            thumb_width = 150
+
+            for i in range(doc.page_count):
+                page = doc.load_page(i)
+
+                scale = (display_width / page.rect.width) * zoom_factor
+                pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                page_images.append(img)
+
+                timg = img.copy()
+                timg.thumbnail((thumb_width, int(thumb_width * img.height / max(1, img.width))))
+                thumb_images.append(timg)
+
+            return RenderedPDFBundle(page_images=page_images, thumb_images=thumb_images)
+        finally:
+            doc.close()
+
     def _configure_style(self) -> None:
         self.root.configure(bg="#eef2f7")
         style = ttk.Style(self.root)
@@ -813,7 +996,7 @@ class OfflineGraderApp:
             return
 
         top = tk.Toplevel(self.root)
-        top.title("README")
+        top.title(f"README v{APP_VERSION}")
         top.geometry("860x760")
         top.transient(self.root)
 
@@ -932,14 +1115,14 @@ class OfflineGraderApp:
         center.rowconfigure(1, weight=0)
         center.columnconfigure(0, weight=1)
         center.columnconfigure(1, weight=0)
-        self.canvas = tk.Canvas(center, bg="#f5f5f5", highlightthickness=0)
+        self.canvas = tk.Canvas(center, bg="#f5f5f5", highlightthickness=0, takefocus=1)
         self.canvas.grid(row=0, column=0, sticky="nsew")
         cscroll = ttk.Scrollbar(center, orient="vertical", command=self.canvas.yview)
         cscroll.grid(row=0, column=1, sticky="ns")
         hscroll = ttk.Scrollbar(center, orient="horizontal", command=self.canvas.xview)
         hscroll.grid(row=1, column=0, sticky="ew")
         self.canvas.configure(yscrollcommand=cscroll.set, xscrollcommand=hscroll.set)
-        self.canvas.bind("<Configure>", self._schedule_rerender)
+        self.canvas.bind("<Configure>", self._schedule_pdf_resize)
         self.canvas.bind("<Button-1>", self.on_canvas_click)
         self.canvas.bind("<MouseWheel>", self._on_mousewheel)
         self.canvas.bind("<Button-4>", self._on_mousewheel)
@@ -1071,6 +1254,7 @@ class OfflineGraderApp:
                 self.thumb_canvas.yview_scroll(delta, "units")
             else:
                 self.canvas.yview_scroll(delta, "units")
+                self._schedule_rerender()
         except Exception:
             pass
 
@@ -1629,8 +1813,7 @@ class OfflineGraderApp:
         next_idx = self._find_student_index_for_question(1, require_ungraded=True)
         if next_idx is None:
             return
-        self._queue_student_pdf_prefetch(next_idx)      # keeps raw bytes fallback
-        self._queue_student_pdf_render_prefetch(next_idx)
+        self._queue_student_pdf_prefetch(next_idx)      # keeps a small raw-bytes fallback
     
     def _render_cached_pdf_to_canvas(self, bundle: RenderedPDFBundle, display_width: int) -> None:
         self.canvas.delete("all")
@@ -1690,6 +1873,8 @@ class OfflineGraderApp:
             self._prefetch_inflight.discard(path)
             if data is not None:
                 self._prefetch_cache[path] = data
+                self._prefetch_cache.move_to_end(path)
+                self._trim_prefetch_cache()
 
         future.add_done_callback(_done)
 
@@ -1861,6 +2046,7 @@ class OfflineGraderApp:
     def scroll_pdf(self, delta_units: int) -> None:
         try:
             self.canvas.yview_scroll(delta_units, "units")
+            self._schedule_rerender()
         except Exception:
             pass
 
@@ -1897,6 +2083,20 @@ class OfflineGraderApp:
         total_height = max(1, bbox[3] if bbox else 1)
         target = float(pos["top"])
         self.canvas.yview_moveto(max(0.0, min(1.0, target / total_height)))
+        self._schedule_rerender()
+
+    def _schedule_pdf_resize(self, _event=None) -> None:
+        if self.render_after_id is not None:
+            try:
+                self.root.after_cancel(self.render_after_id)
+            except Exception:
+                pass
+        self.render_after_id = self.root.after(180, self._rerender_layout_if_possible)
+
+    def _rerender_layout_if_possible(self) -> None:
+        self.render_after_id = None
+        if self.current_pdf_path is not None:
+            self._render_current_pdf()
 
     def _schedule_rerender(self, _event=None) -> None:
         if self.render_after_id is not None:
@@ -1904,14 +2104,10 @@ class OfflineGraderApp:
                 self.root.after_cancel(self.render_after_id)
             except Exception:
                 pass
-        self.render_after_id = self.root.after(300, self._rerender_if_possible)
-
-    def _rerender_if_possible(self) -> None:
-        self.render_after_id = None
-        if self.current_pdf_path is not None:
-            self._render_current_pdf()
+        self.render_after_id = self.root.after(120, self._refresh_visible_pages)
 
     def on_canvas_click(self, event: tk.Event) -> None:
+        self.canvas.focus_set()
         if not self.anchor_mode or self.pending_anchor_question is None:
             return
         if not self.page_positions:
@@ -1957,6 +2153,7 @@ class OfflineGraderApp:
         bbox = self.canvas.bbox("all")
         total_height = max(1, bbox[3] if bbox else 1)
         self.canvas.yview_moveto(max(0.0, min(1.0, target / total_height)))
+        self._schedule_rerender()
 
     def _load_current_student_question_into_editor(self) -> None:
         if self.current_student_index < 0 or self.current_question_index < 0 or not self.questions or not self.students:
