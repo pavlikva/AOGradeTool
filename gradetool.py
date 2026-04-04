@@ -618,6 +618,7 @@ class OfflineGraderApp:
         rotation = (self._pdf_rotation_for_path(self.current_pdf_path) + delta) % 360
         self._set_pdf_rotation_for_current_path(rotation)
         self._render_current_pdf()
+        self._save_schema()
         self._update_status(f"PDF rotation: {rotation}°")
 
     def rotate_pdf_clockwise(self) -> None:
@@ -626,8 +627,8 @@ class OfflineGraderApp:
     def rotate_pdf_counterclockwise(self) -> None:
         self._rotate_current_pdf_view(-90)
 
-    def _render_cache_key(self, path: Path, display_width: int, zoom_factor: float, rotation: int) -> tuple[str, int, float, int]:
-        return (str(path.resolve()), int(display_width), round(float(zoom_factor), 3), int(rotation) % 360)
+    def _render_cache_key(self, path: Path, display_width: int, zoom_factor: float) -> tuple[str, int, float]:
+        return (str(path.resolve()), int(display_width), round(float(zoom_factor), 3))
 
     def _trim_render_cache(self) -> None:
         while len(self._render_cache) > MAX_RENDER_CACHE_ENTRIES:
@@ -688,15 +689,15 @@ class OfflineGraderApp:
             y = padding
             thumb_width = 150
             rotation = int(rotation) % 360
+            rotated_quarter_turn = rotation in {90, 270}
 
             for i in range(doc.page_count):
                 page = doc.load_page(i)
-                scale = (display_width / page.rect.width) * zoom_factor
-                matrix = fitz.Matrix(scale, scale).prerotate(rotation)
-                pix = page.get_pixmap(matrix=matrix, alpha=False)
-                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                width = img.width
-                height = img.height
+                base_width = float(page.rect.height if rotated_quarter_turn else page.rect.width)
+                base_height = float(page.rect.width if rotated_quarter_turn else page.rect.height)
+                scale = (display_width / max(1.0, base_width)) * zoom_factor
+                width = max(1, int(round(base_width * scale)))
+                height = max(1, int(round(base_height * scale)))
                 page_positions.append({
                     "page_index": i,
                     "top": y,
@@ -705,9 +706,9 @@ class OfflineGraderApp:
                     "scale": scale,
                 })
 
-                timg = img.copy()
-                timg.thumbnail((thumb_width, int(thumb_width * img.height / max(1, img.width))))
-                thumb_images.append(timg)
+                thumb_scale = thumb_width / max(1.0, base_width)
+                pix = page.get_pixmap(matrix=fitz.Matrix(thumb_scale, thumb_scale).prerotate(rotation), alpha=False)
+                thumb_images.append(Image.frombytes("RGB", [pix.width, pix.height], pix.samples))
                 y += height + padding
 
             return page_positions, thumb_images
@@ -718,8 +719,11 @@ class OfflineGraderApp:
         doc = self._open_pdf_document(path, source_bytes)
         try:
             page = doc.load_page(page_index)
-            scale = (display_width / page.rect.width) * zoom_factor
-            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale).prerotate(int(rotation) % 360), alpha=False)
+            rotation = int(rotation) % 360
+            rotated_quarter_turn = rotation in {90, 270}
+            base_width = float(page.rect.height if rotated_quarter_turn else page.rect.width)
+            scale = (display_width / max(1.0, base_width)) * zoom_factor
+            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale).prerotate(rotation), alpha=False)
             return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
         finally:
             doc.close()
@@ -754,9 +758,10 @@ class OfflineGraderApp:
         self.canvas.configure(scrollregion=(0, 0, 700, 500))
         self.canvas.create_text(20, 20, anchor="nw", text=text, fill=FG_LABEL, font=("Segoe UI", 11))
 
-    def _begin_view_render(self, path: Path, source_bytes: Optional[bytes], display_width: int, zoom_factor: float, rotation: int) -> None:
+    def _begin_view_render(self, path: Path, source_bytes: Optional[bytes], display_width: int, zoom_factor: float) -> None:
         self._cancel_view_render()
         request_id = self._view_render_request_id
+        rotation = self._pdf_rotation_for_path(path)
         cache_key = self._page_layout_cache_key(path, display_width, zoom_factor, rotation)
         self.loading_pdf = True
         self._page_layout_key = cache_key
@@ -1064,6 +1069,7 @@ class OfflineGraderApp:
 
         toolbar = ttk.Frame(outer)
         toolbar.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        toolbar.columnconfigure(3, weight=1)
         toolbar.columnconfigure(12, weight=1)
         toolbar.columnconfigure(13, weight=0)
 
@@ -1095,9 +1101,9 @@ class OfflineGraderApp:
         )
         solution_btn.grid(row=0, column=1, padx=(0, 6), sticky="ew")
 
-        ttk.Button(toolbar, text="Save", command=self.save_csv).grid(row=0, column=2, padx=(0, 8))
-        ttk.Button(toolbar, text="↻", width=3, command=self.rotate_pdf_clockwise).grid(row=0, column=3, padx=(0, 4))
-        ttk.Button(toolbar, text="↺", width=3, command=self.rotate_pdf_counterclockwise).grid(row=0, column=4, padx=(0, 12))
+        ttk.Button(toolbar, text="Save", command=self.save_csv).grid(row=0, column=2, padx=(0, 12))
+        ttk.Button(toolbar, text="↻", width=3, command=self.rotate_pdf_clockwise).grid(row=0, column=4, padx=(0, 4))
+        ttk.Button(toolbar, text="↺", width=3, command=self.rotate_pdf_counterclockwise).grid(row=0, column=5, padx=(0, 12))
         ttk.Button(toolbar, text="?", width=3, command=self.show_readme_popup).grid(row=0, column=13, sticky="e")
 
         left = ttk.Frame(outer)
@@ -1357,7 +1363,6 @@ class OfflineGraderApp:
                 for q in self.questions
             ],
             "anchors": {qid: dataclasses.asdict(anchor) for qid, anchor in self.anchors.items()},
-            "pdf_rotations": dict(self._pdf_rotations),
             "applied_buckets": {
                 student: {
                     qid: list(cell.applied_bucket_ids)
@@ -1369,6 +1374,7 @@ class OfflineGraderApp:
             },
             "current_question_index": self.current_question_index,
             "current_student_index": self.current_student_index,
+            "pdf_rotations": dict(self._pdf_rotations),
         }
 
     def _save_schema(self) -> None:
@@ -1420,12 +1426,6 @@ class OfflineGraderApp:
                 )
             except Exception:
                 continue
-        self._pdf_rotations = {}
-        for key, value in data.get("pdf_rotations", {}).items():
-            try:
-                self._pdf_rotations[str(key)] = int(value) % 360
-            except Exception:
-                continue
         subdir = data.get("submission_dir", "")
         self.submission_dir = Path(subdir) if subdir else self.submission_dir
         clean = data.get("clean_pdf", "")
@@ -1434,6 +1434,12 @@ class OfflineGraderApp:
         self.solution_pdf = Path(sol) if sol else None
         self.current_question_index = int(data.get("current_question_index", -1))
         self.current_student_index = int(data.get("current_student_index", -1))
+        self._pdf_rotations = {}
+        for key, value in data.get("pdf_rotations", {}).items():
+            try:
+                self._pdf_rotations[str(key)] = int(value) % 360
+            except Exception:
+                continue
         for student, qmap in data.get("applied_buckets", {}).items():
             if not isinstance(qmap, dict):
                 continue
@@ -2120,7 +2126,6 @@ class OfflineGraderApp:
             self.current_pdf_bytes,
             display_width,
             self.zoom_factor,
-            self._pdf_rotation_for_path(self.current_pdf_path),
         )
 
     def scroll_to_page(self, page_index: int) -> None:
