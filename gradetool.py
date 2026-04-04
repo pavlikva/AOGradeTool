@@ -582,8 +582,9 @@ class OfflineGraderApp:
         self._page_render_cache: OrderedDict[tuple[str, int, float, int], Image.Image] = OrderedDict()
         self._page_render_inflight: set[tuple[str, int, float, int]] = set()
         self._page_render_request_id = 0
-        self._page_layout_key: Optional[tuple[str, int, float]] = None
+        self._page_layout_key: Optional[tuple[str, int, float, int]] = None
         self._page_photo_refs: dict[int, ImageTk.PhotoImage] = {}
+        self._pdf_rotations: dict[str, int] = {}
 
         self.bucket_buttons: dict[str, tk.Button] = {}
         self.bucket_button_specs: dict[str, Bucket] = {}
@@ -598,8 +599,35 @@ class OfflineGraderApp:
     def _current_display_width(self) -> int:
         return max(650, self.canvas.winfo_width() - 25)
 
-    def _render_cache_key(self, path: Path, display_width: int, zoom_factor: float) -> tuple[str, int, float]:
-        return (str(path.resolve()), int(display_width), round(float(zoom_factor), 3))
+    def _pdf_rotation_key(self, path: Path) -> str:
+        return str(path.resolve())
+
+    def _pdf_rotation_for_path(self, path: Optional[Path]) -> int:
+        if path is None:
+            return 0
+        return int(self._pdf_rotations.get(self._pdf_rotation_key(path), 0)) % 360
+
+    def _set_pdf_rotation_for_current_path(self, rotation: int) -> None:
+        if self.current_pdf_path is None:
+            return
+        self._pdf_rotations[self._pdf_rotation_key(self.current_pdf_path)] = int(rotation) % 360
+
+    def _rotate_current_pdf_view(self, delta: int) -> None:
+        if self.current_pdf_path is None:
+            return
+        rotation = (self._pdf_rotation_for_path(self.current_pdf_path) + delta) % 360
+        self._set_pdf_rotation_for_current_path(rotation)
+        self._render_current_pdf()
+        self._update_status(f"PDF rotation: {rotation}°")
+
+    def rotate_pdf_clockwise(self) -> None:
+        self._rotate_current_pdf_view(90)
+
+    def rotate_pdf_counterclockwise(self) -> None:
+        self._rotate_current_pdf_view(-90)
+
+    def _render_cache_key(self, path: Path, display_width: int, zoom_factor: float, rotation: int) -> tuple[str, int, float, int]:
+        return (str(path.resolve()), int(display_width), round(float(zoom_factor), 3), int(rotation) % 360)
 
     def _trim_render_cache(self) -> None:
         while len(self._render_cache) > MAX_RENDER_CACHE_ENTRIES:
@@ -638,11 +666,11 @@ class OfflineGraderApp:
         finally:
             doc.close()
 
-    def _page_layout_cache_key(self, path: Path, display_width: int, zoom_factor: float) -> tuple[str, int, float]:
-        return (str(path.resolve()), int(display_width), round(float(zoom_factor), 3))
+    def _page_layout_cache_key(self, path: Path, display_width: int, zoom_factor: float, rotation: int) -> tuple[str, int, float, int]:
+        return (str(path.resolve()), int(display_width), round(float(zoom_factor), 3), int(rotation) % 360)
 
-    def _page_render_cache_key(self, path: Path, display_width: int, zoom_factor: float, page_index: int) -> tuple[str, int, float, int]:
-        return (*self._page_layout_cache_key(path, display_width, zoom_factor), int(page_index))
+    def _page_render_cache_key(self, path: Path, display_width: int, zoom_factor: float, rotation: int, page_index: int) -> tuple[str, int, float, int, int]:
+        return (*self._page_layout_cache_key(path, display_width, zoom_factor, rotation), int(page_index))
 
     def _trim_page_render_cache(self) -> None:
         while len(self._page_render_cache) > MAX_RENDER_CACHE_ENTRIES:
@@ -651,7 +679,7 @@ class OfflineGraderApp:
     def _open_pdf_document(self, path: Path, source_bytes: Optional[bytes] = None) -> fitz.Document:
         return fitz.open(stream=source_bytes, filetype="pdf") if source_bytes is not None else fitz.open(str(path))
 
-    def _build_page_layout(self, path: Path, display_width: int, zoom_factor: float, source_bytes: Optional[bytes] = None) -> tuple[list[dict[str, object]], list[Image.Image]]:
+    def _build_page_layout(self, path: Path, display_width: int, zoom_factor: float, rotation: int, source_bytes: Optional[bytes] = None) -> tuple[list[dict[str, object]], list[Image.Image]]:
         doc = self._open_pdf_document(path, source_bytes)
         try:
             page_positions: list[dict[str, object]] = []
@@ -659,12 +687,16 @@ class OfflineGraderApp:
             padding = 18
             y = padding
             thumb_width = 150
+            rotation = int(rotation) % 360
 
             for i in range(doc.page_count):
                 page = doc.load_page(i)
                 scale = (display_width / page.rect.width) * zoom_factor
-                width = max(1, int(round(page.rect.width * scale)))
-                height = max(1, int(round(page.rect.height * scale)))
+                matrix = fitz.Matrix(scale, scale).prerotate(rotation)
+                pix = page.get_pixmap(matrix=matrix, alpha=False)
+                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                width = img.width
+                height = img.height
                 page_positions.append({
                     "page_index": i,
                     "top": y,
@@ -673,21 +705,21 @@ class OfflineGraderApp:
                     "scale": scale,
                 })
 
-                thumb_scale = thumb_width / max(1.0, float(page.rect.width))
-                pix = page.get_pixmap(matrix=fitz.Matrix(thumb_scale, thumb_scale), alpha=False)
-                thumb_images.append(Image.frombytes("RGB", [pix.width, pix.height], pix.samples))
+                timg = img.copy()
+                timg.thumbnail((thumb_width, int(thumb_width * img.height / max(1, img.width))))
+                thumb_images.append(timg)
                 y += height + padding
 
             return page_positions, thumb_images
         finally:
             doc.close()
 
-    def _render_page_image(self, path: Path, page_index: int, display_width: int, zoom_factor: float, source_bytes: Optional[bytes] = None) -> Image.Image:
+    def _render_page_image(self, path: Path, page_index: int, display_width: int, zoom_factor: float, rotation: int, source_bytes: Optional[bytes] = None) -> Image.Image:
         doc = self._open_pdf_document(path, source_bytes)
         try:
             page = doc.load_page(page_index)
             scale = (display_width / page.rect.width) * zoom_factor
-            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale).prerotate(int(rotation) % 360), alpha=False)
             return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
         finally:
             doc.close()
@@ -722,10 +754,10 @@ class OfflineGraderApp:
         self.canvas.configure(scrollregion=(0, 0, 700, 500))
         self.canvas.create_text(20, 20, anchor="nw", text=text, fill=FG_LABEL, font=("Segoe UI", 11))
 
-    def _begin_view_render(self, path: Path, source_bytes: Optional[bytes], display_width: int, zoom_factor: float) -> None:
+    def _begin_view_render(self, path: Path, source_bytes: Optional[bytes], display_width: int, zoom_factor: float, rotation: int) -> None:
         self._cancel_view_render()
         request_id = self._view_render_request_id
-        cache_key = self._page_layout_cache_key(path, display_width, zoom_factor)
+        cache_key = self._page_layout_cache_key(path, display_width, zoom_factor, rotation)
         self.loading_pdf = True
         self._page_layout_key = cache_key
         self._show_pdf_loading_placeholder()
@@ -735,6 +767,7 @@ class OfflineGraderApp:
             path,
             display_width,
             zoom_factor,
+            rotation,
             source_bytes,
         )
 
@@ -860,7 +893,7 @@ class OfflineGraderApp:
             image_id = pos.get("image_id")
             if image_id is not None and idx in self._page_photo_refs:
                 continue
-            cache_key = self._page_render_cache_key(self.current_pdf_path, self._current_display_width(), self.zoom_factor, idx)
+            cache_key = self._page_render_cache_key(self.current_pdf_path, self._current_display_width(), self.zoom_factor, self._pdf_rotation_for_path(self.current_pdf_path), idx)
             cached = self._page_render_cache.get(cache_key)
             if cached is not None:
                 self._page_render_cache.move_to_end(cache_key)
@@ -871,7 +904,7 @@ class OfflineGraderApp:
     def _queue_page_render(self, page_index: int) -> None:
         if self.current_pdf_path is None or page_index < 0 or page_index >= len(self.page_positions):
             return
-        cache_key = self._page_render_cache_key(self.current_pdf_path, self._current_display_width(), self.zoom_factor, page_index)
+        cache_key = self._page_render_cache_key(self.current_pdf_path, self._current_display_width(), self.zoom_factor, self._pdf_rotation_for_path(self.current_pdf_path), page_index)
         if cache_key in self._page_render_cache or cache_key in self._page_render_inflight:
             return
         self._page_render_inflight.add(cache_key)
@@ -881,7 +914,7 @@ class OfflineGraderApp:
         zoom_factor = self.zoom_factor
         source_bytes = self.current_pdf_bytes
 
-        future = self._page_render_executor.submit(self._render_page_image, path, page_index, display_width, zoom_factor, source_bytes)
+        future = self._page_render_executor.submit(self._render_page_image, path, page_index, display_width, zoom_factor, self._pdf_rotation_for_path(path), source_bytes)
 
         def _done(fut, req=request_id, key=cache_key, idx=page_index, pdf_path=path) -> None:
             self._page_render_inflight.discard(key)
@@ -1062,7 +1095,9 @@ class OfflineGraderApp:
         )
         solution_btn.grid(row=0, column=1, padx=(0, 6), sticky="ew")
 
-        ttk.Button(toolbar, text="Save", command=self.save_csv).grid(row=0, column=2, padx=(0, 12))
+        ttk.Button(toolbar, text="Save", command=self.save_csv).grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(toolbar, text="↻", width=3, command=self.rotate_pdf_clockwise).grid(row=0, column=3, padx=(0, 4))
+        ttk.Button(toolbar, text="↺", width=3, command=self.rotate_pdf_counterclockwise).grid(row=0, column=4, padx=(0, 12))
         ttk.Button(toolbar, text="?", width=3, command=self.show_readme_popup).grid(row=0, column=13, sticky="e")
 
         left = ttk.Frame(outer)
@@ -1210,6 +1245,10 @@ class OfflineGraderApp:
 
     def _bind_shortcuts(self) -> None:
         self.root.bind("<Control-s>", lambda e: self.save_csv())
+        self.root.bind_all("<Control-r>", lambda e: (self.rotate_pdf_clockwise(), "break")[1])
+        self.root.bind_all("<Control-R>", lambda e: (self.rotate_pdf_clockwise(), "break")[1])
+        self.root.bind_all("<Control-e>", lambda e: (self.rotate_pdf_counterclockwise(), "break")[1])
+        self.root.bind_all("<Control-E>", lambda e: (self.rotate_pdf_counterclockwise(), "break")[1])
         self.root.bind_all("<Control-MouseWheel>", self._on_ctrl_mousewheel)
         self.root.bind_all("<Control-Button-4>", self._on_ctrl_mousewheel)
         self.root.bind_all("<Control-Button-5>", self._on_ctrl_mousewheel)
@@ -1318,6 +1357,7 @@ class OfflineGraderApp:
                 for q in self.questions
             ],
             "anchors": {qid: dataclasses.asdict(anchor) for qid, anchor in self.anchors.items()},
+            "pdf_rotations": dict(self._pdf_rotations),
             "applied_buckets": {
                 student: {
                     qid: list(cell.applied_bucket_ids)
@@ -1378,6 +1418,12 @@ class OfflineGraderApp:
                     x_ratio=float(araw.get("x_ratio", 0.0)),
                     y_ratio=float(araw.get("y_ratio", 0.0)),
                 )
+            except Exception:
+                continue
+        self._pdf_rotations = {}
+        for key, value in data.get("pdf_rotations", {}).items():
+            try:
+                self._pdf_rotations[str(key)] = int(value) % 360
             except Exception:
                 continue
         subdir = data.get("submission_dir", "")
@@ -2060,6 +2106,7 @@ class OfflineGraderApp:
             return
         self.current_pdf_path = pdf_path
         self.current_pdf_bytes = self._consume_prefetched_pdf_bytes(pdf_path)
+        self._set_pdf_rotation_for_current_path(self._pdf_rotation_for_path(pdf_path))
         self._render_current_pdf()
         self._update_status(f"Viewing {student}")
         self._jump_to_current_question_anchor()
@@ -2073,6 +2120,7 @@ class OfflineGraderApp:
             self.current_pdf_bytes,
             display_width,
             self.zoom_factor,
+            self._pdf_rotation_for_path(self.current_pdf_path),
         )
 
     def scroll_to_page(self, page_index: int) -> None:
