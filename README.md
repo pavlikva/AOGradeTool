@@ -1,4 +1,4 @@
-# Astronomy Olympiad PDF Grader (v1.3)
+# Astronomy Olympiad PDF Grader (v1.5)
 
 **Author:** Václav Pavlík  
 **Assisted by:** ChatGPT  
@@ -29,20 +29,20 @@ This application is optimized for **fast, keyboard-driven grading** of large bat
 
 1. Load submissions folder  
 2. Define questions  
-3. Create a CSV file
-4. Load clean answersheet
-5. Define an Anchor for each question
-6. Start grading
-- Select a question and grade all students using `PgUp / PgDown`
-- Select a student and grade all questions using `Left / Right`
-7. Repeat for the next question or student
+3. Create a CSV file  
+4. Load clean answersheet  
+5. Define an Anchor for each question  
+6. Start grading  
+- Select a question and grade all students using `PgUp / PgDown`  
+- Select a student and grade all questions using `Left / Right`  
+7. Repeat for the next question or student  
 8. Save (automatic saves also happen when you select a different student)
 
 ### Resume grading
 
-1. Load CSV file
-2. Optionally load the submissions folder (if it does not load automatically)
-3. Start grading
+1. Load CSV file  
+2. Optionally load the submissions folder (if it does not load automatically)  
+3. Start grading  
 
 ---
 
@@ -56,6 +56,8 @@ This application is optimized for **fast, keyboard-driven grading** of large bat
 | Apply scoring bucket | `0–9` |
 | Zoom PDF | `Ctrl + Scroll` |
 | Scroll through PDF | `Up / Down` |
+| Rotate PDF clockwise | `Ctrl + R` |
+| Rotate PDF counterclockwise | `Ctrl + E` |
 | Apply custom score | `Enter` |
 | Save | `Ctrl + S` |
 
@@ -93,9 +95,30 @@ You can:
 
 Use **"Set Anchor"** on a clean answer sheet:
 
-1. Select a question
+1. Select a question  
 2. Click where the question begins  
-3. The app will then automatically scroll student PDFs to this location
+3. The app will then automatically scroll student PDFs to this location  
+
+---
+
+## 🔄 PDF Rotation
+
+The middle preview supports **on-the-fly rotation**:
+
+- Two buttons in the top toolbar allow:
+  - Clockwise rotation  
+  - Counterclockwise rotation  
+- Rotation is also available via keyboard shortcuts:
+  - `Ctrl + R` → rotate clockwise  
+  - `Ctrl + E` → rotate counterclockwise  
+
+### Behavior
+
+- Rotation applies **per loaded PDF**  
+- It is **non-destructive** (original file unchanged)  
+- Useful for:
+  - Scanned submissions with wrong orientation  
+  - Mixed portrait/landscape pages  
 
 ---
 
@@ -106,6 +129,7 @@ grades.csv              # Scores, notes, grading status
 grades.schema.json      # Configuration, anchors, app state (auto-created)
 /some-folder/*.pdf      # Student submissions location
 ```
+
 
 ### Notes
 
@@ -133,23 +157,24 @@ If the folder structure is preserved, PDFs may be detected automatically.
 ## ⚙️ Features
 
 ### PDF Handling
-- Fast rendering via **PyMuPDF**
-- Background preloading
-- Render caching for smooth navigation
+- Fast rendering via **PyMuPDF**  
+- Background preloading  
+- Render caching for smooth navigation  
+- On-the-fly rotation  
 
 ### Navigation
-- Automatic skipping of graded students
-- Efficient keyboard workflow
+- Automatic skipping of graded students  
+- Efficient keyboard workflow  
 
 ### Grading
-- Bucket-based scoring system
-- Keyboard shortcuts
-- Add / set scoring modes
+- Bucket-based scoring system  
+- Keyboard shortcuts  
+- Add / set scoring modes  
 
 ### Persistence
-- Scores, notes, buckets
-- Anchors
-- Last used paths
+- Scores, notes, buckets  
+- Anchors  
+- Last used paths  
 
 ---
 
@@ -158,6 +183,7 @@ If the folder structure is preserved, PDFs may be detected automatically.
 - Prefer keyboard over mouse  
 - Grade one question across all students  
 - Use anchors to eliminate manual scrolling  
+- Rotate once per student if needed, then continue grading  
 
 ---
 
